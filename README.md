@@ -26,8 +26,7 @@ cmake --install build --prefix ~/.local
 ```
 
 This installs `0mk` in `~/.local/bin`; ensure that directory is on `PATH`.
-It also installs `0mk.h`, the CMake package, protocol specifications, and the
-[scientific pipeline example](examples/science).
+It also installs `0mk.h`, the CMake package, and the protocol specifications.
 
 ## USE
 

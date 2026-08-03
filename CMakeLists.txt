@@ -51,7 +51,6 @@ install(TARGETS mk0_header EXPORT 0mkTargets INCLUDES DESTINATION "${CMAKE_INSTA
 install(FILES 0mk.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 install(FILES README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 install(DIRECTORY docs/ DESTINATION "${CMAKE_INSTALL_DOCDIR}/docs")
-install(DIRECTORY examples/ DESTINATION "${CMAKE_INSTALL_DOCDIR}/examples")
 
 configure_package_config_file(
     cmake/0mkConfig.cmake.in
