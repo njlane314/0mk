@@ -1,0 +1,16 @@
+all <- report.txt copy.txt joined.txt
+
+copy.txt <- input.txt
+	cp "$<" "$@"
+
+upper.txt <- input.txt @shell
+	tr '[:lower:]' '[:upper:]' < $< > $@
+
+report.txt <- upper.txt @shell
+	sed 's/$/!/' $< > $@
+
+joined.txt <- input.txt upper.txt
+	sh -c 'cat "$1" "$2" > "$3"' sh $^ $@
+
+check! <- report.txt
+	test -s $<

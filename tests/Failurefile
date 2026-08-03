@@ -1,0 +1,2 @@
+stable.txt <- input.txt @shell
+	printf '%s\n' replacement > $@; false

@@ -1,0 +1,7 @@
+all <- a ./a
+
+a <- input.txt
+	cp $< $@
+
+./a <- input.txt
+	cp $< $@
