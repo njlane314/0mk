@@ -1,90 +1,159 @@
-# rivet.h prototype
+# 0mk
 
-`rivet.h` is a compact C++17 prototype of a Unix-style, content-aware dependency
-runner. It is inspired by Make's target/dependency surface but deliberately uses
-a smaller language and different semantics.
+[![Build](https://github.com/njlane314/0mk/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/njlane314/0mk/actions/workflows/ci.yml)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C)
+
+`0mk` is the small, auditable, content-addressed runner for file-producing
+technical pipelines.
+
+It keeps the useful shape of Make while giving coarse tasks stronger semantics:
+inputs are immutable snapshots, one rule produces one file or directory tree,
+profiles choose where work runs, and receipts record exactly why an artifact is
+current. There is no daemon, hosted service, or provider SDK; commands reach a
+shell only when requested explicitly.
+
+## INSTALL
+
+Requires a C++17 compiler, CMake, and a POSIX system.
+
+From the source checkout:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix ~/.local
+~/.local/bin/0mk --version
+```
+
+This installs `0mk` in `~/.local/bin`; ensure that directory is on `PATH`.
+It also installs `0mk.h`, the CMake package, protocol specifications, and the
+[scientific pipeline example](examples/science).
+
+## USE
+
+The checked-in `0mkfile` is a complete local pipeline:
+
+```text
+all <- out/report.txt
+
+out/readme-lines.txt <- README.md
+    sh -c 'wc -l < "$1" | tr -d " " > "$2"' sh $< $@
+
+out/report.txt <- out/readme-lines.txt
+    sh -c 'printf "0mk repository report\nREADME lines: " > "$2"; cat "$1" >> "$2"' sh $< $@
+```
+
+Build and inspect it:
+
+```sh
+0mk plan out/report.txt
+0mk out/report.txt
+0mk why out/report.txt
+0mk inspect out/report.txt
+```
+
+With a profile backed by an executor such as `0mk-exec-large`:
+
+```text
+result.json <- case.tar.zst @large
+    ./solve --input $< --output $@
+```
+
+```sh
+0mk plan result.json
+0mk --submit result.json
+```
+
+`plan` requests are specified as read-only, and executors must honor that
+contract. If an executor reports cost-bearing or externally submitted work,
+execution requires explicit `--submit` approval.
+
+## RULES
 
 ```text
 target <- dependencies... [@profile]
-    recipe using $@, $<, and $^
+    command using $@, $<, and $^
 
 alias <- dependencies...
 
 action! <- dependencies... [@profile]
-    always-run recipe
+    always-run command
 ```
 
-Normal rules produce exactly one regular file. The recipe writes `$@` into a
-private workspace; Rivet hashes it, stores it in `.rivet/objects`, publishes it
-atomically, and writes a receipt keyed by the complete task identity. Returning
-inputs from A to B to A can therefore restore the earlier A result without
-re-executing it. A workspace lock serialises mutating Rivet processes. Cache
-keys include the recipe, profile identity, dependency names, and dependency
-contents rather than modification times.
+`$@` is the private output path, `$<` is the first artifact input, and `$^`
+expands to every artifact input. New recipes are parsed as argument vectors, not
+passed to a shell. Invoke `sh -c` explicitly for redirection, pipelines, or
+expansion. The deprecated `@shell` profile remains only for older graphs.
 
-## Build
+A rule produces one logical file or tree artifact. An alias groups dependencies.
+An action always runs and cannot be a dependency; it is intended for absolute
+or external side effects because relative files in its private workspace are
+discarded.
 
-```sh
-c++ -std=c++17 -Wall -Wextra -Wpedantic rivet.cpp -o rivet
-./tests/run.sh
+## EXECUTORS
+
+`@local` runs commands directly. Any other profile is discovered through
+`PATH`: `@large` resolves to `0mk-exec-large`. Embedding applications can
+register a C++ executor callback instead.
+
+External executors use the same task manifests and artifact semantics as local
+execution. The runner uses a versioned JSON protocol for environment identity,
+read-only planning, execution, and inspection; the protocol also defines durable
+handles and cancellation for executor-side tooling. If an executor marks work
+as requiring submission, `0mk` refuses it without `--submit`, and the protocol
+requires the executor to recheck that approval. See
+[`docs/executor-protocol.md`](docs/executor-protocol.md).
+
+## FILES
+
+```text
+project/
+├── 0mkfile                    authored graph
+├── source and output files
+└── .0mk/                      local state
+    ├── objects/ and trees/    content-addressed artifacts
+    ├── receipts/ and targets/ provenance and current heads
+    └── runs/                  per-invocation evidence
 ```
 
-The top-level `Rivetfile` is the domain-shaped example; `tests/Rivetfile` is a
-small runnable graph built from ordinary Unix utilities.
+Before execution, declared inputs and repository-relative tools are imported
+into the store and materialized read-only. Modes are preserved. `off` always
+runs, `declared` trusts declared inputs and the executor fingerprint, and
+`hermetic` requires the executor to attest to a complete environment identity.
+Under a reusable policy, two outputs for one task key are reported as
+nondeterminism rather than silently replacing evidence.
 
-## Use
+Use `--state-dir PATH` to relocate state, and `0mk cache verify|du|gc` to inspect
+it. The exact task identity, receipt fields, flat tree format, and retention
+rules are specified in [`docs/state-format.md`](docs/state-format.md).
 
-```sh
-./rivet                   # build the first target
-./rivet report.pdf
-./rivet -n report.pdf     # dry-run
-./rivet --why report.pdf  # explain cache decisions
-./rivet -B report.pdf     # force execution
-```
-
-The default `@local` profile tokenises and executes an argument vector directly
-without invoking a shell. Use the explicit `@shell` profile for pipelines,
-redirection, or other shell syntax. In a shell recipe, automatic variables must
-appear unquoted; Rivet inserts their shell-quoted values.
-
-The example `@large` profile is registered as another local argv executor in
-`rivet.cpp`. A real application can replace it with a callback that invokes
-`cloud.h`, SSH, a container runtime, Slurm, a hardware test rig, or another
-execution environment.
-
-## Embed
-
-The header also exposes the engine directly:
+## EMBED
 
 ```cpp
-rivet::engine graph;
-graph.profile("large", my_remote_executor());
+#include <0mk.h>
 
-rivet::run_options options;
-options.file = "Rivetfile";
-options.targets = {"report.pdf"};
-return graph.run(std::move(options));
+int main() {
+    mk0::engine engine;
+    mk0::run_options options;
+    options.targets = {"all"};
+    return engine.run(std::move(options));
+}
 ```
 
-An executor receives a stable task key, raw and expanded recipe forms, typed
-inputs (`logical_name`, `local_path`, `digest`, availability), a private
-workspace, and the required output path. During a dry-run, planning is deferred
-when an upstream artifact does not exist yet. This keeps the graph language
-independent of Burst, SSH, Slurm, containers, CI, or any other backend.
+CMake consumers use `find_package(0mk CONFIG REQUIRED)` and link `0mk::0mk`.
+The C++ namespace is `mk0` because an identifier cannot begin with a digit.
 
-## Deliberate prototype limits
+## CHECKS
 
-- POSIX-first, single-process, sequential scheduling;
-- one output file and one recipe line per rule;
-- regular-file inputs and outputs;
-- content-only identity (Unix mode bits are not cached as artifact data);
-- direct Unix process execution for `@local`, plus an explicit `@shell` profile;
-- completed-task recovery only, not attachment to in-flight remote jobs;
-- no cache garbage collector yet;
-- no GNU Make variables, implicit rules, patterns, or directory artifacts.
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
 
-Actions may be requested as roots but cannot be dependencies: their side
-effects deliberately do not participate in artifact identity.
+CI runs the complete suite with GCC and Clang on Linux and Apple Clang on macOS.
 
-The executor interface and graph/cache semantics are the reusable part; the
-shell executor is merely the zero-dependency demonstration backend.
+## LICENSE
+
+No license has been selected yet. Redistribution or reuse requires an explicit
+license choice.

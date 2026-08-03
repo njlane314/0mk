@@ -1,0 +1,3 @@
+kind-target <- input.txt
+	cp $< $@
+	chmod 444 $@

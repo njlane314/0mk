@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+signal_dir=${MK0_TEST_SIGNAL_DIR:?MK0_TEST_SIGNAL_DIR is required}
+pid_file=$signal_dir/$1
+signal_file=$signal_dir/$2
+output=$3
+
+trap 'printf "TERM\n" > "$signal_file"; exit 143' TERM
+trap 'printf "INT\n" > "$signal_file"; exit 130' INT
+printf '%s\n' "$$" > "$pid_file"
+
+while :; do
+    sleep 1
+done
+
+# This is intentionally unreachable unless cancellation is broken.
+printf 'not cancelled\n' > "$output"

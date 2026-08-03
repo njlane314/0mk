@@ -1,0 +1,4 @@
+all <- slow.txt
+
+slow.txt <- input.txt @slow
+	cp $< $@

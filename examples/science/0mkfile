@@ -1,4 +1,4 @@
-# Example Rivetfile. The commands are illustrative application contracts.
+# Illustrative application contracts; see README.md for the required inputs and tools.
 
 all <- report.pdf
 

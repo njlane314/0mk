@@ -1,0 +1,13 @@
+all <- external.txt
+
+external.txt <- input.txt @mock
+	/bin/sh -c 'tr "[:lower:]" "[:upper:]" < "$1" > "$2"' sh $< $@
+
+external-action! <- external.txt @mock
+	/bin/sh -c 'test -s "$1"' sh $<
+
+prepared.txt <- input.txt @mock
+	cp $< $@
+
+external-deferred.txt <- prepared.txt @mock
+	cp $< $@

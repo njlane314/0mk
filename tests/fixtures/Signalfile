@@ -1,0 +1,5 @@
+signal.txt <- input.txt
+	./fixtures/bin/wait-signal child.pid signal.seen $@
+
+after-signal.txt <- input.txt
+	cp $< $@

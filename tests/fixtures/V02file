@@ -1,0 +1,25 @@
+all <- executable.sh output-tree counted.txt tool-output.txt env-output.txt
+
+executable.sh <- input.txt @shell
+	sh -c 'printf "#!/bin/sh\nprintf result\n" > "$1"; chmod 751 "$1"' sh $@
+
+output-tree <- input.txt @shell
+	sh -c 'mkdir -p "$1/nested"; cp "$2" "$1/nested/data.txt"; chmod 750 "$1"; chmod 640 "$1/nested/data.txt"' sh $@ $<
+
+counted.txt <- input.txt
+	cp $< $@
+
+noisy.txt <- input.txt
+	sh -c 'printf "recipe-noise\\n"; cp "$1" "$2"' sh $< $@
+
+nondeterministic.txt <- input.txt
+	./fixtures/bin/vary-output $@
+
+tool-output.txt <- input.txt
+	./fixtures/bin/tool-version $< $@
+
+env-output.txt <- input.txt
+	./fixtures/bin/env-value $< $@
+
+tree-tool-output.txt <- fixtures/bin input.txt
+	./fixtures/bin/tool-version input.txt $@

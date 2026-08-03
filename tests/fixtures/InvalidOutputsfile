@@ -1,0 +1,8 @@
+symlink.txt <- input.txt @shell
+	ln -s input.txt $@
+
+directory.txt <- input.txt
+	mkdir $@
+
+linked/output.txt <- input.txt
+	cp $< $@

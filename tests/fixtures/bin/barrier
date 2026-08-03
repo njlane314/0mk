@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+barrier_dir=${MK0_TEST_BARRIER_DIR:?MK0_TEST_BARRIER_DIR is required}
+own_marker=$barrier_dir/$1
+peer_marker=$barrier_dir/$2
+output=$3
+
+: > "$own_marker"
+attempt=0
+while test ! -e "$peer_marker"; do
+    attempt=$((attempt + 1))
+    if test "$attempt" -ge 5; then
+        printf 'peer task did not start concurrently\n' >&2
+        exit 70
+    fi
+    sleep 1
+done
+printf 'parallel\n' > "$output"

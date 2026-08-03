@@ -1,0 +1,10 @@
+all <- 'output dir/report file.txt' shell-vars.txt dollar.txt
+
+'output dir/report file.txt' <- 'input dir/source file.txt'
+	cp $< $@
+
+shell-vars.txt <- 'input dir/source file.txt' 'input dir/second file.txt' @shell
+	sh -c 'printf "%s\n%s\n%s\n" "$1" "$2" "$3" > "$4"' sh $< $^ $@
+
+dollar.txt <- 'input dir/source file.txt'
+	sh -c 'printf "%s\n" "$1" > "$2"' sh '$$HOME' $@

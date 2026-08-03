@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+pid_file=${MK0_EXEC_SLOW_PID_FILE:?MK0_EXEC_SLOW_PID_FILE is required}
+trap 'exit 143' TERM
+trap 'exit 130' INT
+printf '%s\n' "$$" > "$pid_file"
+while :; do
+    sleep 1
+done

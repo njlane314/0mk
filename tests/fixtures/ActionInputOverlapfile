@@ -1,0 +1,4 @@
+all <- check
+
+check! <- data data/value.txt
+	sh -c 'test -f "$1"' sh data/value.txt

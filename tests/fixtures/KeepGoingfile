@@ -1,0 +1,5 @@
+bad.txt <- input.txt @shell
+	sh -c 'exit 9' sh $@
+
+good.txt <- input.txt
+	cp $< $@

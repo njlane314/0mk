@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""Deterministic 0mk-exec-v1 fixture.
+
+The mock executes argv/shell commands and persists a small durable-handle record.
+Contract tests can configure it with:
+
+  MK0_EXEC_MOCK_CACHE_POLICY=declared|hermetic|off
+  MK0_EXEC_MOCK_COST_USD=0.74
+  MK0_EXEC_MOCK_REQUIRE_SUBMIT=1
+  MK0_EXEC_MOCK_EXIT_CODE=23
+  MK0_EXEC_MOCK_WARNING='test warning'
+  MK0_EXEC_MOCK_STATE_DIR=/temporary/test/state
+  MK0_EXEC_MOCK_REQUEST_LOG=/temporary/test/requests.jsonl
+
+Standard output remains exclusively the single protocol response.
+"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+PROTOCOL = "0mk-exec-v1"
+MOCK_VERSION = "mock-executor-v1"
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+DIGEST = re.compile(r"^[0-9a-f]{64}$")
+POLICY_RANK = {"off": 0, "declared": 1, "hermetic": 2}
+OPERATIONS = {"identity", "plan", "run", "cancel", "inspect"}
+
+
+class ProtocolFailure(Exception):
+    def __init__(self, status, code, message, retryable=False):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
+def canonical(value):
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def emit(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+def fail(status, code, message, retryable=False):
+    raise ProtocolFailure(status, code, message, retryable)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail(64, "invalid_json", "duplicate JSON object key: " + key)
+        result[key] = value
+    return result
+
+
+def read_request(operation):
+    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    if len(raw) > MAX_REQUEST_BYTES:
+        fail(64, "request_too_large", "request exceeds 8 MiB")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(64, "invalid_json", "request is not UTF-8")
+    try:
+        request = json.loads(text, object_pairs_hook=unique_object)
+    except ProtocolFailure:
+        raise
+    except (TypeError, ValueError) as error:
+        fail(64, "invalid_json", "cannot parse request: " + str(error))
+    if not isinstance(request, dict):
+        fail(64, "invalid_request", "request must be a JSON object")
+    if request.get("protocol") != PROTOCOL:
+        fail(64, "incompatible_protocol", "protocol must be " + PROTOCOL)
+    if request.get("operation") != operation:
+        fail(64, "operation_mismatch", "JSON operation does not match argv")
+    profile = request.get("profile")
+    if not isinstance(profile, str) or not profile or "/" in profile:
+        fail(64, "invalid_profile", "profile must be a nonempty name without '/'")
+
+    log_path = os.environ.get("MK0_EXEC_MOCK_REQUEST_LOG")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as output:
+            output.write(canonical(request) + "\n")
+    return request
+
+
+def configured_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    fail(70, "invalid_mock_configuration", name + " must be a boolean")
+
+
+def configured_policy():
+    selected = os.environ.get("MK0_EXEC_MOCK_CACHE_POLICY", "declared")
+    if selected not in POLICY_RANK:
+        fail(70, "invalid_mock_configuration", "invalid mock cache policy")
+    return selected
+
+
+def configured_cost():
+    raw = os.environ.get("MK0_EXEC_MOCK_COST_USD", "0")
+    try:
+        value = float(raw)
+    except ValueError:
+        fail(70, "invalid_mock_configuration", "mock cost must be a number")
+    if value < 0 or value == float("inf") or value != value:
+        fail(70, "invalid_mock_configuration", "mock cost must be finite and non-negative")
+    if value.is_integer():
+        return int(value)
+    return value
+
+
+def required_string(value, name, allow_empty=False):
+    if not isinstance(value, str) or (not allow_empty and not value):
+        fail(64, "invalid_request", name + " must be a string")
+    return value
+
+
+def required_bool(value, name):
+    if not isinstance(value, bool):
+        fail(64, "invalid_request", name + " must be a boolean")
+    return value
+
+
+def required_digest(value, name):
+    value = required_string(value, name)
+    if not DIGEST.fullmatch(value):
+        fail(64, "invalid_request", name + " must be 64 lowercase hexadecimal digits")
+    return value
+
+
+def required_decimal(value, name):
+    value = required_string(value, name)
+    if not value.isdigit():
+        fail(64, "invalid_request", name + " must be an unsigned decimal string")
+    return int(value)
+
+
+def task_from(request, for_run=False):
+    task = request.get("task")
+    if not isinstance(task, dict):
+        fail(64, "invalid_request", "task must be a JSON object")
+    required_digest(task.get("key"), "task.key")
+    attempt = required_string(task.get("attempt"), "task.attempt", allow_empty=not for_run)
+    if attempt and not DIGEST.fullmatch(attempt):
+        fail(64, "invalid_request", "task.attempt must be empty or 64 lowercase hex digits")
+    required_string(task.get("target"), "task.target")
+
+    policy = task.get("cache_policy")
+    if policy not in POLICY_RANK:
+        fail(64, "invalid_request", "task.cache_policy is invalid")
+    if POLICY_RANK[policy] > POLICY_RANK[configured_policy()]:
+        fail(64, "unsupported_cache_policy", "task requests a stronger cache policy")
+
+    for field in ("workspace", "source_root", "working_directory"):
+        path = Path(required_string(task.get(field), "task." + field))
+        if not path.is_absolute():
+            fail(64, "invalid_request", "task." + field + " must be absolute")
+
+    output = required_string(task.get("output"), "task.output", allow_empty=True)
+    if output and not Path(output).is_absolute():
+        fail(64, "invalid_request", "task.output must be absolute or empty")
+
+    commands = task.get("commands")
+    if not isinstance(commands, list):
+        fail(64, "invalid_request", "task.commands must be an array")
+    for index, command in enumerate(commands):
+        if not isinstance(command, dict):
+            fail(64, "invalid_request", "task command must be an object")
+        kind = command.get("kind")
+        if kind == "argv":
+            argv = command.get("argv")
+            if not isinstance(argv, list) or not argv or not all(
+                isinstance(item, str) for item in argv
+            ):
+                fail(64, "invalid_request", "argv command must have nonempty string argv")
+        elif kind == "shell":
+            required_string(command.get("command"), "task.commands[].command")
+        else:
+            fail(64, "invalid_request", "unknown command kind at index " + str(index))
+
+    inputs = task.get("inputs")
+    if not isinstance(inputs, list):
+        fail(64, "invalid_request", "task.inputs must be an array")
+    for item in inputs:
+        validate_input(item, for_run)
+
+    environment = task.get("environment")
+    if not isinstance(environment, list):
+        fail(64, "invalid_request", "task.environment must be an array")
+    previous = None
+    for item in environment:
+        if not isinstance(item, dict):
+            fail(64, "invalid_request", "environment entry must be an object")
+        name = required_string(item.get("name"), "environment name")
+        required_digest(item.get("digest"), "environment digest")
+        if previous is not None and name <= previous:
+            fail(64, "invalid_request", "environment entries must be uniquely sorted by name")
+        previous = name
+
+    if "submit" not in request:
+        fail(64, "invalid_request", "submit must be present for plan and run")
+    required_bool(request.get("submit"), "submit")
+    return task
+
+
+def validate_input(item, for_run):
+    if not isinstance(item, dict):
+        fail(64, "invalid_request", "input entry must be an object")
+    required_string(item.get("name"), "input name")
+    path = Path(required_string(item.get("path"), "input path", allow_empty=not for_run))
+    if str(path) and not path.is_absolute():
+        fail(64, "invalid_request", "input path must be absolute")
+    available = required_bool(item.get("available"), "input available")
+    provisional = required_bool(item.get("provisional"), "input provisional")
+    if for_run and (not available or provisional):
+        fail(64, "provisional_input", "run input must be available and non-provisional")
+
+    artifact = item.get("artifact")
+    if not isinstance(artifact, dict):
+        fail(64, "invalid_request", "input artifact must be an object")
+    kind = artifact.get("kind")
+    if kind not in ("file", "tree"):
+        fail(64, "invalid_request", "input artifact kind must be file or tree")
+    required_digest(artifact.get("digest"), "artifact digest")
+    required_decimal(artifact.get("size"), "artifact size")
+    mode = required_decimal(artifact.get("mode"), "artifact mode")
+    if mode > 4095:
+        fail(64, "invalid_request", "artifact mode contains bits outside 07777")
+
+
+def executor_identity(profile, policy):
+    manifest = {
+        "cache_policy": policy,
+        "executor": MOCK_VERSION,
+        "profile": profile,
+        "protocol": PROTOCOL,
+    }
+    return hashlib.sha256(canonical(manifest).encode("utf-8")).hexdigest()
+
+
+def identity(request):
+    policy = configured_policy()
+    emit(
+        {
+            "cache_policy": policy,
+            "identity": executor_identity(request["profile"], policy),
+            "protocol": PROTOCOL,
+        }
+    )
+
+
+def plan(request):
+    task_from(request, for_run=False)
+    cost = configured_cost()
+    requires_submit = configured_bool("MK0_EXEC_MOCK_REQUIRE_SUBMIT", cost != 0)
+    warning = os.environ.get("MK0_EXEC_MOCK_WARNING")
+    warnings = [] if warning is None else warning.splitlines()
+    emit(
+        {
+            "estimated_cost_usd": cost,
+            "facts": {"executor": "mock", "profile": request["profile"]},
+            "protocol": PROTOCOL,
+            "requires_submit": requires_submit,
+            "warnings": warnings,
+        }
+    )
+
+
+def state_root():
+    configured = os.environ.get("MK0_EXEC_MOCK_STATE_DIR")
+    return Path(configured) if configured else Path.cwd() / ".0mk" / "mock-executor"
+
+
+def handle_for(profile, task):
+    seed = (profile + "\0" + task["key"] + "\0" + task["attempt"]).encode("utf-8")
+    return "mock:" + hashlib.sha256(seed).hexdigest()[:32]
+
+
+def state_path(handle):
+    name = hashlib.sha256(handle.encode("utf-8")).hexdigest() + ".json"
+    return state_root() / name
+
+
+def save_state(record):
+    root = state_root()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="state-", dir=str(root))
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(canonical(record) + "\n")
+        os.replace(temporary, state_path(record["handle"]))
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def load_state(handle):
+    path = state_path(handle)
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            value = json.load(source, object_pairs_hook=unique_object)
+    except FileNotFoundError:
+        return None
+    except (OSError, TypeError, ValueError) as error:
+        fail(70, "corrupt_mock_state", "cannot read mock handle state: " + str(error))
+    if not isinstance(value, dict) or value.get("handle") != handle:
+        fail(70, "corrupt_mock_state", "mock handle state does not match handle")
+    return value
+
+
+def path_is_within(path, parent):
+    try:
+        return os.path.commonpath((str(path), str(parent))) == str(parent)
+    except ValueError:
+        return False
+
+
+def validate_snapshot(item):
+    path = Path(item["path"])
+    artifact = item["artifact"]
+    try:
+        status = path.lstat()
+    except OSError as error:
+        fail(69, "input_unavailable", "cannot stat input snapshot: " + str(error), True)
+    if stat.S_ISLNK(status.st_mode):
+        fail(64, "invalid_input", "input snapshot must not be a symlink")
+    if artifact["kind"] == "file" and not stat.S_ISREG(status.st_mode):
+        fail(64, "invalid_input", "file input is not a regular file")
+    if artifact["kind"] == "tree" and not stat.S_ISDIR(status.st_mode):
+        fail(64, "invalid_input", "tree input is not a directory")
+    declared_mode = int(artifact["mode"])
+    if stat.S_IMODE(status.st_mode) not in (declared_mode, declared_mode & ~0o222):
+        fail(64, "invalid_input", "input mode does not match its manifest")
+    if artifact["kind"] == "file":
+        if status.st_size != int(artifact["size"]):
+            fail(64, "invalid_input", "input size does not match its manifest")
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+        if digest.hexdigest() != artifact["digest"]:
+            fail(64, "invalid_input", "input digest does not match its manifest")
+    else:
+        tree_size = inspect_tree(path)
+        if tree_size != int(artifact["size"]):
+            fail(64, "invalid_input", "tree size does not match its manifest")
+
+
+def inspect_tree(root):
+    total_size = 0
+    try:
+        for path in root.rglob("*"):
+            status = path.lstat()
+            if stat.S_ISLNK(status.st_mode):
+                fail(64, "invalid_input", "tree input contains a symlink")
+            if stat.S_ISDIR(status.st_mode):
+                continue
+            if not stat.S_ISREG(status.st_mode):
+                fail(64, "invalid_input", "tree input contains an unsupported entry")
+            total_size += status.st_size
+    except OSError as error:
+        fail(69, "input_unavailable", "cannot read tree snapshot: " + str(error), True)
+    return total_size
+
+
+def terminal_response(record):
+    response = {
+        "exit_code": int(record["exit_code"]),
+        "handle": record["handle"],
+        "metadata": record["metadata"],
+        "protocol": PROTOCOL,
+    }
+    emit(response)
+
+
+def run(request):
+    task = task_from(request, for_run=True)
+    cost = configured_cost()
+    requires_submit = configured_bool("MK0_EXEC_MOCK_REQUIRE_SUBMIT", cost != 0)
+    requires_submit = configured_bool("MK0_EXEC_MOCK_RUN_REQUIRE_SUBMIT", requires_submit)
+    if requires_submit and not request["submit"]:
+        fail(77, "approval_required", "mock profile requires submit approval")
+
+    for item in task["inputs"]:
+        validate_snapshot(item)
+
+    workspace = Path(task["workspace"]).resolve(strict=False)
+    output_text = task["output"]
+    output = Path(output_text).resolve(strict=False) if output_text else None
+    if output is not None and not path_is_within(output, workspace):
+        fail(64, "invalid_output", "output path is outside the task workspace")
+
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    working_directory = Path(task["working_directory"])
+    if not working_directory.is_dir():
+        fail(69, "working_directory_unavailable", "working directory does not exist", True)
+
+    handle = handle_for(request["profile"], task)
+    existing = load_state(handle)
+    if existing is not None and existing.get("state") in ("completed", "failed", "cancelled"):
+        if existing.get("state") != "completed" or output is None or output.exists():
+            terminal_response(existing)
+            return
+        fail(75, "durable_output_missing", "completed mock attempt lost its local output", True)
+    if existing is not None and existing.get("state") in ("queued", "running"):
+        fail(75, "attempt_running", "an attempt with this task key is already running", True)
+
+    metadata = {
+        "command_count": str(len(task["commands"])),
+        "executor": "mock",
+        "attempt": task["attempt"],
+        "profile": request["profile"],
+        "task_key": task["key"],
+    }
+    record = {
+        "exit_code": 125,
+        "handle": handle,
+        "metadata": metadata,
+        "output": output_text,
+        "state": "running",
+    }
+    save_state(record)
+
+    forced = os.environ.get("MK0_EXEC_MOCK_EXIT_CODE")
+    if forced is not None:
+        try:
+            exit_code = int(forced)
+        except ValueError:
+            fail(70, "invalid_mock_configuration", "mock exit code must be an integer")
+        if exit_code < 0 or exit_code > 255:
+            fail(70, "invalid_mock_configuration", "mock exit code must be between 0 and 255")
+    else:
+        exit_code = execute_commands(task, handle, working_directory)
+
+    latest = load_state(handle)
+    if latest is not None and latest.get("state") == "cancelled":
+        terminal_response(latest)
+        return
+
+    if exit_code == 0 and output is not None:
+        try:
+            output_status = output.lstat()
+        except OSError:
+            output_status = None
+        if output_status is None:
+            metadata["error"] = "successful commands did not create the output"
+            exit_code = 74
+        elif stat.S_ISLNK(output_status.st_mode):
+            metadata["error"] = "output is a symlink"
+            exit_code = 74
+        elif not (stat.S_ISREG(output_status.st_mode) or stat.S_ISDIR(output_status.st_mode)):
+            metadata["error"] = "output is not a file or tree"
+            exit_code = 74
+
+    record["exit_code"] = exit_code
+    record["metadata"] = metadata
+    record["state"] = "completed" if exit_code == 0 else "failed"
+    save_state(record)
+    terminal_response(record)
+
+
+def execute_commands(task, handle, working_directory):
+    for command in task["commands"]:
+        latest = load_state(handle)
+        if latest is not None and latest.get("state") == "cancelled":
+            return 130
+        if command["kind"] == "argv":
+            argv = command["argv"]
+        else:
+            argv = ["/bin/sh", "-c", command["command"]]
+        sys.stderr.write("mock executor: " + " ".join(repr(item) for item in argv) + "\n")
+        sys.stderr.flush()
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(working_directory),
+                stdin=subprocess.DEVNULL,
+                stdout=sys.stderr,
+                stderr=sys.stderr,
+                check=False,
+            )
+        except FileNotFoundError:
+            return 127
+        except PermissionError:
+            return 126
+        if completed.returncode < 0:
+            return 128 + (-completed.returncode)
+        if completed.returncode != 0:
+            return completed.returncode
+    return 0
+
+
+def inspect(request):
+    handle = required_string(request.get("handle"), "handle")
+    record = load_state(handle)
+    if record is None:
+        emit(
+            {
+                "facts": {"state": "unknown"},
+                "handle": handle,
+                "protocol": PROTOCOL,
+                "state": "unknown",
+            }
+        )
+        return
+    state = record.get("state", "unknown")
+    metadata = record.get("metadata", {})
+    facts = {"state": state}
+    for key, value in metadata.items():
+        facts["metadata." + key] = value
+    response = {
+        "facts": facts,
+        "handle": handle,
+        "metadata": metadata,
+        "protocol": PROTOCOL,
+        "state": state,
+    }
+    if response["state"] in ("completed", "failed", "cancelled"):
+        response["exit_code"] = int(record.get("exit_code", 125))
+        facts["exit_code"] = str(response["exit_code"])
+    emit(response)
+
+
+def cancel(request):
+    handle = required_string(request.get("handle"), "handle")
+    record = load_state(handle)
+    if record is None:
+        emit({"cancelled": False, "handle": handle, "protocol": PROTOCOL, "state": "unknown"})
+        return
+    if record.get("state") in ("queued", "running"):
+        record["exit_code"] = 130
+        record["state"] = "cancelled"
+        save_state(record)
+        cancelled = True
+    else:
+        cancelled = False
+    emit(
+        {
+            "cancelled": cancelled,
+            "handle": handle,
+            "protocol": PROTOCOL,
+            "state": record.get("state", "unknown"),
+        }
+    )
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in OPERATIONS:
+        fail(64, "invalid_operation", "expected identity, plan, run, cancel, or inspect")
+    operation = sys.argv[1]
+    request = read_request(operation)
+    if operation == "identity":
+        identity(request)
+    elif operation == "plan":
+        plan(request)
+    elif operation == "run":
+        run(request)
+    elif operation == "inspect":
+        inspect(request)
+    else:
+        cancel(request)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ProtocolFailure as error:
+        emit(
+            {
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    "retryable": error.retryable,
+                },
+                "protocol": PROTOCOL,
+            }
+        )
+        sys.exit(error.status)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BaseException as error:
+        emit(
+            {
+                "error": {
+                    "code": "internal_error",
+                    "message": str(error),
+                    "retryable": False,
+                },
+                "protocol": PROTOCOL,
+            }
+        )
+        sys.exit(70)

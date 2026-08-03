@@ -1,0 +1,7 @@
+all <- parallel-a.txt parallel-b.txt
+
+parallel-a.txt <- input.txt
+	./fixtures/bin/barrier parallel-a.started parallel-b.started $@
+
+parallel-b.txt <- input.txt
+	./fixtures/bin/barrier parallel-b.started parallel-a.started $@

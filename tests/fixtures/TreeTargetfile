@@ -1,0 +1,4 @@
+kind-target <- input.txt
+	mkdir $@
+	cp $< $@/value.txt
+	chmod 555 $@

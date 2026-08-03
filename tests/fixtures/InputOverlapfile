@@ -1,0 +1,4 @@
+all <- result.txt
+
+result.txt <- data data/value.txt
+	cp data/value.txt $@

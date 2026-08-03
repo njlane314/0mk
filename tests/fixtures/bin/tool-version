@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+test -f "$1"
+printf 'tool-v1\n' > "$2"

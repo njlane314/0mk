@@ -1,0 +1,9 @@
+# A self-contained pipeline using only standard POSIX tools.
+
+all <- out/report.txt
+
+out/readme-lines.txt <- README.md
+	sh -c 'wc -l < "$1" | tr -d " " > "$2"' sh $< $@
+
+out/report.txt <- out/readme-lines.txt
+	sh -c 'printf "0mk repository report\nREADME lines: " > "$2"; cat "$1" >> "$2"' sh $< $@

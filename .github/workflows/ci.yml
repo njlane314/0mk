@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC
+            os: ubuntu-latest
+            compiler: g++
+          - name: Linux Clang
+            os: ubuntu-latest
+            compiler: clang++
+          - name: macOS AppleClang
+            os: macos-latest
+            compiler: clang++
+
+    env:
+      CXX: ${{ matrix.compiler }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$CXX"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Check installation
+        run: cmake --install build --prefix "$RUNNER_TEMP/0mk-install"
+
+      - name: Check package
+        run: cpack --config build/CPackConfig.cmake -G TGZ -B build/package

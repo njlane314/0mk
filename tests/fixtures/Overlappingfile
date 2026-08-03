@@ -1,0 +1,7 @@
+all <- out out/report.txt
+
+out <- input.txt
+	mkdir $@
+
+out/report.txt <- input.txt
+	cp $< $@

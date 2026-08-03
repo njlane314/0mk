@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+test -f "$1"
+printf '%s\n' "${MK0_TEST_VALUE:-missing}" > "$2"
